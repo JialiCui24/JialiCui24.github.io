@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+    <id>https://jialicui24.github.io</id>
+    <title>Jiali Cui</title>
+    <updated>2022-07-05T16:50:39.287Z</updated>
+    <generator>https://github.com/jpmonette/feed</generator>
+    <link rel="alternate" href="https://jialicui24.github.io"/>
+    <link rel="self" href="https://jialicui24.github.io/atom.xml"/>
+    <subtitle>Be Humble</subtitle>
+    <logo>https://jialicui24.github.io/images/avatar.png</logo>
+    <icon>https://jialicui24.github.io/favicon.ico</icon>
+    <rights>All rights reserved 2022, Jiali Cui</rights>
+    <entry>
+        <title type="html"><![CDATA[Pytorch DDP Tutorial]]></title>
+        <id>https://jialicui24.github.io/post/pytorch-ddp-tutorial/</id>
+        <link href="https://jialicui24.github.io/post/pytorch-ddp-tutorial/">
+        </link>
+        <updated>2022-07-05T04:49:53.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="one-machine-multiple-gpus-code">One Machine Multiple GPUs (Code)</h3>
+<h4 id="import-ddp-packages">Import DDP Packages.</h4>
+<pre><code class="language-ruby">import torch.distributed as dist
+import torch
+import torch.multiprocessing as mp
+</code></pre>
+<h4 id="main-entrance">Main Entrance</h4>
+<pre><code class="language-ruby">def main(local_rank, nprocs, args):
+    # ==============================Prepare DDP ================================
+    args.local_rank = local_rank
+    init_seeds(args.seed)
+    os.environ['MASTER_ADDR'] = args.master_address
+    os.environ['MASTER_PORT'] = args.master_port
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend='nccl', init_method='env://', world_size=nprocs, rank=local_rank)
+    
+    model, opt = build_model(args, local_rank)
+    train_queue, _, _ = build_loaders(args)
+    train(model, opt, train_queue, local_rank, nprocs, args)
+    dist.destroy_process_group()
+    
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='PyTorch Training')
+    # Other hyper-params added
+    # ================= DDP ===================
+    parser.add_argument('--local_rank', default=-1, type=int, help='node rank for distributed')
+    parser.add_argument('--seed', default=0, type=int, help='seed for initializing. ')
+    parser.add_argument('--master_address', type=str, default='127.0.0.1', help='master addr')
+    parser.add_argument('--master_port', type=str, default='6020', help='port for master')
+    parser.add_argument('--nprocs', type=int, default=4, help='number of gpus')
+    args = parser.parse_args()
+    mp.spawn(main, nprocs=args.nprocs, args=(args.nprocs, args))
+</code></pre>
+<p><strong>local_rank</strong>: will set up automatically by torch.multiprocessing, where local_rank 0 is assumed to be the master one taking care of the logging jobs (print, save, ...).<br>
+<strong>master_address</strong> and <strong>master_port</strong>: the address used for communication between GPUs. Make sure the address is not used.<br>
+<strong>nprocs</strong>: The numbers of GPUs.</p>
+<h4 id="build-model-and-loaders">Build Model and Loaders</h4>
+<pre><code class="language-ruby">def average_params(params, is_distributed):
+    &quot;&quot;&quot; parameter averaging. &quot;&quot;&quot;
+    if is_distributed:
+        size = float(dist.get_world_size())
+        for param in params:
+            dist.all_reduce(param.data, op=dist.ReduceOp.SUM)
+            param.data /= size
+
+def build_model(args, local_rank)
+
+	model = Model(args).cuda(local_rank)
+	
+	dist.barrier() # wait
+	# make sure the initialized params are the same
+	average_params(model.parameters(), is_distributed=True) 
+	
+	# Adam for example
+	opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+	
+	return model, opt
+
+def build_loaders(args)
+	# Your DataSet train_data, valid_data
+	
+    train_sampler, valid_sampler = None, None
+    if args.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_data)
+        valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_data)
+        
+    train_queue = torch.utils.data.DataLoader(
+        train_data, batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler, pin_memory=True, num_workers=8, drop_last=True)# 8
+
+    valid_queue = torch.utils.data.DataLoader(
+        valid_data, batch_size=args.batch_size,
+        shuffle=(valid_sampler is None),
+        sampler=valid_sampler, pin_memory=True, num_workers=1, drop_last=False) # 1
+
+    return train_queue, valid_queue, num_classes
+</code></pre>
+<p><strong>averge_params</strong>: used to make sure the model located at different GPU is initialized the same.<br>
+<strong>sampler</strong>: can split the dataset into (len(dataset) / #GPUs) sets and allocate them for GPUs. For example, 10000 images and 100 batch size, you will have 100 batchs for training with one GPU. Using four GPUs and sampler, only 25 batchs are for training on each GPU then. Speed up 4 times for training.</p>
+<h4 id="training">Training</h4>
+<pre><code class="language-ruby">def average_gradients(params, is_distributed): # syn grads between GPUs
+    &quot;&quot;&quot; Gradient averaging. &quot;&quot;&quot;
+    if is_distributed:
+        size = float(dist.get_world_size())
+        for param in params:
+            if param.requires_grad:
+                dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+                param.grad.data /= size
+                
+def train(model, opt, train_queue, local_rank, nprocs, args):
+    global_step = 0
+    for ep in range(args.epochs):
+	    train_queue.sampler.set_epoch(global_step) # randomize training data queue
+        for b, x in enumerate(train_queue):
+            global_step += 1
+            x = x[0] if len(x) &gt; 1 else x
+		    x = x.cuda()
+			model.train()
+			# Loss 
+			model.zero_grad()
+			loss = model(x)
+			loss.backward()
+			average_gradients(model.parameters(), args.distributed)
+            opt.step()
+			
+			model.eval()
+			# Logging
+			if local_rank == 0:
+				print(logging)
+				save_img(model)
+			# saving
+			if local_rank == 0 and save_condition:
+				save(model, opt)
+
+			# testing
+			if local_rank == 0 and test_condition:
+				test(model)
+			dist_barrier() # wait master testing
+	return
+</code></pre>
+<p><strong>average_gradients</strong>: make sure the updated parameters are the same.<br>
+<strong>dist.barrier()</strong>: Again, it is for waiting and starting together.</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Recent Read]]></title>
+        <id>https://jialicui24.github.io/post/learning-energy-based-models-in-highdimensional-spaces-with-multi-scale-denoising-score-matching/</id>
+        <link href="https://jialicui24.github.io/post/learning-energy-based-models-in-highdimensional-spaces-with-multi-scale-denoising-score-matching/">
+        </link>
+        <updated>2022-06-19T17:55:39.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="hierarchical-disentangled-representation-learning"><strong>Hierarchical / Disentangled Representation Learning</strong></h2>
+<ol>
+<li>Rethinking Controllable Variational Autoencoders, CVPR2022</li>
+<li>SemanticStyleGAN: Learning Compositional Generative Priors for Controllable Image Synthesis and Editing, CVPR2022</li>
+</ol>
+<h2 id="methodology"><strong>Methodology</strong></h2>
+<h3 id="score-matching">Score Matching</h3>
+<ol>
+<li>Generative Modeling By Estimating Gradients of the Data Distribution, NIPS2019 (SM)</li>
+<li>Bi-level Score Matching for Learning Energy-based Latent Variable Models, NIPS2020</li>
+<li>Socre-Based Generative Modeling Through Stochastic Differential Equations, ICLR2021(SDE)</li>
+<li>High-Resolution Image Synthesis with Latent Diffusion Models, CVPR2022</li>
+</ol>
+<h3 id="mle">MLE</h3>
+<ol>
+<li>Bi-level doubl Variational Learning for Energy-based Latent Variable Models, CVPR2022</li>
+<li>Gaussian Process Modeling of Approximate Inference Errors forVariational Autoencoders, CVPR2022</li>
+</ol>
+<h2 id="continual-learning"><strong>Continual Learning</strong></h2>
+<ol>
+<li>Learning Bayesian Sparse Networks with Full Experience Replay for Continual Learning, CVPR2022</li>
+<li>Energy-based Latent Aligner for Incremental Learning, CVPR2022</li>
+<li>Using Hindsight to Anchor Past Knowledge in Continual Learning, AAAI2021</li>
+<li>Continual Learning with Tiny Episodic Memories, ICML2019</li>
+<li>In Defense of the Learning Without Forgetting for Task Incremental Learning, CVPR2021</li>
+<li>Conditional Channel Gated Networks for Task-Aware Continual Learning, CVPR2020</li>
+<li>Dark Experience for General Continual Learning: a Strong, Simple Baseline. NIPS2020</li>
+</ol>
+<h2 id="ood-ad"><strong>OOD / AD</strong></h2>
+<ol>
+<li>Neural Mean Discrepancy for Efficient Out-of-Distribution Detection, CVPR2022</li>
+</ol>
+]]></content>
+    </entry>
+</feed>
